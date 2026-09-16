@@ -1,0 +1,592 @@
+#include <TFT_eSPI.h>
+#include <SPI.h>
+
+TFT_eSPI tft = TFT_eSPI();
+
+// ==========================================
+// 1. 硬體腳位定義 (嚴格對應 brian4.ino)
+// ==========================================
+#define L_X 34
+#define L_Y 35
+#define L_Z 25 
+#define R_X 32
+#define R_Y 33
+#define R_Z 26 
+#define BTN_A 13 
+#define BTN_B 14 
+#define BUZZER_PIN 22  
+
+#define MOTOR_R 5   
+#define MOTOR_L 12  
+
+// ==========================================
+// ==========================================
+// 2. 全域變數與系統狀態 (修正版)
+// ==========================================
+volatile int v_lx, v_ly, v_lz;
+volatile int v_rx, v_ry, v_rz;
+volatile int btn_a, btn_b;
+
+int gameState = 0; 
+int menuIndex = 0;
+int subMenuIndex = 0;      // 新增：子選單索引
+bool isMultiplayer = false; // ★ 修正：補上這個缺失的宣告 ★
+
+unsigned long lastAction = 0;
+unsigned long lastFrameTime = 0;
+const int frameDelay = 33; 
+
+// 音效與馬達專用
+unsigned long audioEndTime = 0;
+unsigned long motorEndTimeR = 0;
+unsigned long motorEndTimeL = 0;
+#define AUDIO_RES 8    
+#define AUDIO_FREQ 2000
+
+// ==========================================
+// 3. 戰鬥機遊戲數據結構 (1-10 關重構版)
+// ==========================================
+struct Point { float x, y; };
+struct Bullet { float x, y, vx, vy; bool active; int hp; }; // hp 用於區分負面彈種
+struct Enemy { float x, y, vx; bool active; int hp; };
+struct Boss { 
+  float x, y, vx; int hp, maxHp; bool active; 
+  unsigned long stateTime; int state; float ox, oy; 
+  uint16_t color; 
+};
+
+Point p = {160, 200};
+float pvx = 0, pvy = 0;
+Bullet bullets[50];       
+Bullet bossBullets[80];   
+Enemy enemies[8];
+Boss boss;
+
+int fighterScore = 0, nextBossScore = 40;
+int gameLevel = 1, playerHp = 5;
+unsigned long lastShoot = 0, invincibleTime = 0;
+
+// ★ 進化與負面狀態變數 ★
+int playerStatus = 0; 
+unsigned long statusTimer = 0;
+uint16_t bossColors[] = {0x001F, 0xF81F, 0x07FF, 0xFDA0, 0xF800, 0x780F, 0x07E0, 0xFFFF, 0xFFE0, 0x8000};
+
+// ==========================================
+// 4. 硬體控制函式 (保留原始震動與音效精髓)
+// ==========================================
+
+// 原始 playSound: 支援頻率、持續時間與音量
+void playSound(int freq, int dur, int vol) {
+  ledcWriteTone(BUZZER_PIN, freq);
+  audioEndTime = millis() + dur;
+}
+
+// 原始更新函式: 確保時間到自動關閉，不阻塞主程式
+void updateAudio() { 
+  if (millis() > audioEndTime) ledcWriteTone(BUZZER_PIN, 0); 
+}
+
+// 原始震動控制: 支援左右馬達獨立或同時驅動
+void triggerVibration(int mode, int dur) {
+  if (mode == 0 || mode == 2) motorEndTimeL = millis() + dur;
+  if (mode == 1 || mode == 2) motorEndTimeR = millis() + dur;
+}
+
+// 原始馬達更新: 物理層面驅動 GPIO
+void updateMotors() {
+  digitalWrite(MOTOR_L, (millis() < motorEndTimeL) ? HIGH : LOW);
+  digitalWrite(MOTOR_R, (millis() < motorEndTimeR) ? HIGH : LOW);
+}
+
+// 繪製 UI 通用函式
+void drawExitButton() {
+  tft.fillRect(290, 0, 30, 30, TFT_RED);
+  tft.setTextColor(TFT_WHITE); tft.drawCentreString("X", 305, 5, 2);
+}
+
+void drawBox(int y, String txt, bool sel) {
+  tft.drawRect(40, y, 240, 32, sel ? TFT_YELLOW : TFT_WHITE);
+  tft.setTextColor(sel ? TFT_YELLOW : TFT_WHITE);
+  tft.drawCentreString(txt, 160, y+8, 2);
+}// ==========================================
+// 5. 戰鬥機遊戲專屬邏輯 (1-10 關進化版)
+// ==========================================
+
+void initFighter() {
+  p = {160, 200}; pvx = 0; pvy = 0; fighterScore = 0; nextBossScore = 40;
+  gameLevel = 1; playerHp = 5; playerStatus = 0; statusTimer = 0;
+  for(int i=0; i<50; i++) bullets[i].active = false;
+  for(int i=0; i<80; i++) bossBullets[i].active = false;
+  for(int i=0; i<8; i++) enemies[i].active = false;
+  boss.active = false; tft.fillScreen(TFT_BLACK);
+}
+
+// 帶有完整音效與馬達回饋的受傷函式
+void takeDamage(int dmg, int statusType = 0) {
+  if (millis() < invincibleTime) return;
+  playerHp -= dmg;
+  
+  if (statusType > 0) {
+    playerStatus = statusType;
+    statusTimer = millis() + 3000; 
+    // 負面狀態專用音效與震動
+    if(statusType == 1) { playSound(400, 400, 15); triggerVibration(2, 400); } // 減速：低重音
+    else if(statusType == 2) { playSound(1800, 100, 12); delay(20); playSound(1200, 100, 12); triggerVibration(0, 300); } // 反轉：錯亂音
+    else if(statusType == 3) { playSound(5000, 80, 20); triggerVibration(1, 500); } // 禁射：尖銳電子音
+  } else {
+    playSound(150, 200, 15); // 普通受傷：低沉爆炸音
+    triggerVibration(2, 250); 
+  }
+  invincibleTime = millis() + 1200;
+}
+
+void firePlayerBullet(float x, float y, float vx, float vy) {
+  for(int i=0; i<50; i++) {
+    if(!bullets[i].active) { bullets[i] = {x, y, vx, vy, true, 0}; break; }
+  }
+}
+
+void fireBossBullet(float x, float y, float vx, float vy, int type = 0) {
+  for(int i=0; i<80; i++) {
+    if(!bossBullets[i].active) { bossBullets[i] = {x, y, vx, vy, true, type}; break; }
+  }
+}
+
+void playFighter() {
+  // 雙搖桿按下退出
+  if (v_lz == LOW && v_rz == LOW) { gameState = 0; delay(400); return; }
+
+  // --- 1. 負面狀態物理處理 ---
+  float mSpeed = 1.0; int mDir = 1; bool canShoot = true;
+  if (millis() < statusTimer) {
+    if (playerStatus == 1) mSpeed = 0.5;
+    if (playerStatus == 2) mDir = -1;
+    if (playerStatus == 3) canShoot = false;
+  } else { playerStatus = 0; }
+
+  pvx += ((v_lx - 2048) / 180.0) * mSpeed * mDir;
+  pvy += ((v_ly - 2048) / 180.0) * mSpeed * mDir;
+  pvx *= 0.78; pvy *= 0.78;
+  p.x = constrain(p.x + pvx, 10, 310); p.y = constrain(p.y + pvy, 10, 230);
+
+  // --- 2. 進化外觀繪製 ---
+  int evo = (gameLevel + 1) / 2; // 每兩關一進化
+  uint16_t pCol = (millis() < invincibleTime && (millis()/100)%2==0) ? TFT_RED : TFT_SKYBLUE;
+  tft.fillTriangle(p.x, p.y-14, p.x-10, p.y+10, p.x+10, p.y+10, pCol);
+  if(evo >= 2) tft.drawFastHLine(p.x-15, p.y+5, 30, TFT_LIGHTGREY); // 側翼
+  if(evo >= 4) tft.fillCircle(p.x, p.y, 4, TFT_WHITE); // 核心
+  tft.fillRect(p.x-3, p.y+10, 6, 6, (millis()%80 > 40)? TFT_ORANGE : TFT_RED); // 動態噴火
+
+  // --- 3. 1-10 關進化射擊與專屬音效 ---
+  if (canShoot && (v_rx < 1000 || v_rx > 3000 || v_ry < 1000 || v_ry > 3000 || btn_a == HIGH)) {
+    int sd = max(60, 260 - (gameLevel * 20)); // 射速隨關卡變快
+    if (millis() - lastShoot > sd) {
+      float bs = 5.0 + (gameLevel * 0.5);
+      switch(evo) {
+        case 1: playSound(3500, 40, 6); firePlayerBullet(p.x, p.y-14, 0, -bs); break;
+        case 2: playSound(2800, 50, 8); firePlayerBullet(p.x-6, p.y-10, -1.0, -bs); firePlayerBullet(p.x+6, p.y-10, 1.0, -bs); break;
+        case 3: playSound(2000, 60, 12); for(int i=-2; i<=2; i++) firePlayerBullet(p.x+i*5, p.y-14, i*1.3, -bs); break;
+        case 4: playSound(4500, 30, 8); tft.fillRect(p.x-2, 0, 5, p.y-14, 0x5E5E); // 激光效果
+                if(boss.active && abs(boss.x - p.x) < 30) boss.hp -= 2; break;
+        case 5: playSound(1300, 80, 15); for(float a=-2.5; a<=2.5; a+=1.25) firePlayerBullet(p.x, p.y-16, a*1.6, -bs*1.1); 
+                firePlayerBullet(p.x, p.y+12, 0, bs); // 矩陣砲與後方反擊
+                break;
+      }
+      lastShoot = millis();
+    }
+  }
+
+  // --- 4. Boss 階梯難度系統 ---
+  if (fighterScore >= nextBossScore && !boss.active) {
+    int hp = 60 + (gameLevel * 60); // 隨關卡線性成長的血量
+    boss = {160, 45, 1.8 + (gameLevel*0.4), hp, hp, true, millis(), 0, 160, 45, bossColors[(gameLevel-1)%10]};
+    nextBossScore += 80 + (gameLevel * 10);
+  }
+
+  if (boss.active) {
+    long bt = millis() - boss.stateTime;
+    boss.ox = boss.x; boss.oy = boss.y;
+    boss.x += boss.vx; if (boss.x < 35 || boss.x > 285) boss.vx *= -1;
+    tft.fillRect(boss.ox-30, boss.oy-25, 60, 55, TFT_BLACK); // 擦除舊位置
+
+    // 第 3 關起隨機發射負面狀態彈
+    int st = (gameLevel >= 3) ? (random(1, 4)) : 0; 
+    if (bt % max(300, 1100 - (gameLevel*70)) < 40) {
+      playSound(700, 60, 4);
+      float ang = atan2(p.y - boss.y, p.x - boss.x);
+      fireBossBullet(boss.x, boss.y+18, cos(ang)*3.5, sin(ang)*3.5, st);
+    }
+    // 繪製 Boss (含血條)
+    tft.fillRoundRect(boss.x-25, boss.y-20, 50, 30, 5, boss.color);
+    tft.drawRect(boss.x-20, boss.y-28, 40, 4, TFT_WHITE);
+    tft.fillRect(boss.x-20, boss.y-28, 40 * ((float)boss.hp/boss.maxHp), 4, (boss.hp > boss.maxHp/2)? TFT_GREEN : TFT_RED);
+  }
+
+  // --- 5. 碰撞偵測 (子彈與 Boss) ---
+  for(int i=0; i<50; i++) {
+    if(!bullets[i].active) continue;
+    tft.drawPixel(bullets[i].x, bullets[i].y, TFT_BLACK); // 擦除
+    bullets[i].x += bullets[i].vx; bullets[i].y += bullets[i].vy;
+    if(bullets[i].y < 0 || bullets[i].y > 240) bullets[i].active = false;
+    else {
+      tft.drawPixel(bullets[i].x, bullets[i].y, (evo>=4)? TFT_CYAN : TFT_YELLOW);
+      if(boss.active && abs(bullets[i].x - boss.x) < 25 && abs(bullets[i].y - boss.y) < 20) {
+        bullets[i].active = false; boss.hp--;
+        if(boss.hp <= 0) {
+          playSound(400, 1200, 15); triggerVibration(2, 600); 
+          gameLevel++; boss.active = false; fighterScore += 200;
+          playerHp = min(5, playerHp + 1); // 過關回血
+          tft.fillScreen(TFT_BLACK);
+          tft.drawCentreString("LEVEL CLEAR!", 160, 100, 4); delay(2000);
+          if(gameLevel > 10) { gameState = 0; } tft.fillScreen(TFT_BLACK);
+        }
+      }
+    }
+  }
+
+  // --- 6. Boss 子彈碰撞偵測 ---
+  for(int i=0; i<80; i++) {
+    if(!bossBullets[i].active) continue;
+    tft.drawPixel(bossBullets[i].x, bossBullets[i].y, TFT_BLACK);
+    bossBullets[i].x += bossBullets[i].vx; bossBullets[i].y += bossBullets[i].vy;
+    if(bossBullets[i].y > 240 || bossBullets[i].x < 0 || bossBullets[i].x > 320) bossBullets[i].active = false;
+    else {
+      uint16_t c = (bossBullets[i].hp==1)?TFT_BLUE:(bossBullets[i].hp==2)?TFT_YELLOW:(bossBullets[i].hp==3)?TFT_GREEN:TFT_RED;
+      tft.drawPixel(bossBullets[i].x, bossBullets[i].y, c);
+      if(abs(bossBullets[i].x - p.x) < 10 && abs(bossBullets[i].y - p.y) < 10) {
+        takeDamage(1, bossBullets[i].hp); bossBullets[i].active = false;
+      }
+    }
+  }
+
+  // --- 7. UI 與狀態條 ---
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("LV:"+String(gameLevel)+" HP:"+String(playerHp)+" PTS:"+String(fighterScore), 5, 5, 2);
+  if(playerStatus > 0) {
+    tft.fillRect(5, 22, (statusTimer-millis())/20, 4, TFT_YELLOW); // 負面狀態進度條
+  }
+  drawExitButton();
+}// ==========================================
+// 6. 乒乓球遊戲 (Pong) - 完整未簡化版
+// ==========================================
+int ballX, ballY, ballVX, ballVY;
+int padL, padR, scoreL, scoreR;
+
+void initPong() {
+  ballX = 160; ballY = 120; ballVX = 3; ballVY = 2;
+  padL = 100; padR = 100; scoreL = 0; scoreR = 0;
+  tft.fillScreen(TFT_BLACK);
+}
+
+void playPong() {
+  if (v_lz == LOW || btn_b == HIGH) { gameState = 0; delay(300); return; }
+  
+  // 擦除舊位置
+  tft.fillRect(10, padL, 8, 40, TFT_BLACK);
+  tft.fillRect(302, padR, 8, 40, TFT_BLACK);
+  tft.fillCircle(ballX, ballY, 4, TFT_BLACK);
+
+  // 控制左板 (搖桿)
+  padL = constrain(padL + (v_ly - 2048) / 180, 0, 200);
+  
+  // 控制右板 (雙人或 AI)
+  if (isMultiplayer) {
+    padR = constrain(padR + (v_ry - 2048) / 180, 0, 200);
+  } else {
+    if (ballX > 160) {
+      if (ballY > padR + 20) padR += 3; 
+      else if (ballY < padR + 20) padR -= 3;
+    }
+  }
+
+  // 球物理更新
+  ballX += ballVX; ballY += ballVY;
+  if (ballY <= 0 || ballY >= 240) { ballVY *= -1; playSound(1000, 30, 5); }
+  
+  // 碰撞與震動回饋
+  if (ballX <= 20 && ballY >= padL && ballY <= padL + 40) { 
+    ballVX *= -1.1; ballX = 22; 
+    playSound(1200, 40, 10); triggerVibration(0, 50); 
+  }
+  if (ballX >= 300 && ballY >= padR && ballY <= padR + 40) { 
+    ballVX *= -1.1; ballX = 298; 
+    playSound(1200, 40, 10); triggerVibration(1, 50); 
+  }
+
+  // 得分判定
+  if (ballX < 0) { scoreR++; ballX = 160; ballVX = 3; playSound(300, 200, 10); }
+  if (ballX > 320) { scoreL++; ballX = 160; ballVX = -3; playSound(300, 200, 10); }
+
+  // 繪製
+  tft.fillRect(10, padL, 8, 40, TFT_WHITE);
+  tft.fillRect(302, padR, 8, 40, TFT_WHITE);
+  tft.fillCircle(ballX, ballY, 4, TFT_YELLOW);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawNumber(scoreL, 100, 10, 4); tft.drawNumber(scoreR, 200, 10, 4);
+  drawExitButton();
+}
+
+// ==========================================
+// 7. 貪食蛇 (Snake) - 完整未簡化版
+// ==========================================
+int snakeX[100], snakeY[100], snakeLen, sDir, foodX, foodY;
+unsigned long lastSnakeMove = 0;
+
+void initSnake() {
+  snakeLen = 3; sDir = 1; 
+  for(int i=0; i<3; i++) { snakeX[i] = 10-i; snakeY[i] = 10; }
+  foodX = random(2, 30); foodY = random(2, 22);
+  tft.fillScreen(TFT_BLACK);
+}
+
+void playSnake() {
+  if (v_lz == LOW || btn_b == HIGH) { gameState = 0; delay(300); return; }
+  if (v_ly < 1000 && sDir != 2) sDir = 0;
+  else if (v_lx > 3000 && sDir != 3) sDir = 1;
+  else if (v_ly > 3000 && sDir != 0) sDir = 2;
+  else if (v_lx < 1000 && sDir != 1) sDir = 3;
+
+  if (millis() - lastSnakeMove > 150) {
+    tft.fillRect(snakeX[snakeLen-1]*10, snakeY[snakeLen-1]*10, 9, 9, TFT_BLACK);
+    for(int i=snakeLen-1; i>0; i--) { snakeX[i] = snakeX[i-1]; snakeY[i] = snakeY[i-1]; }
+    
+    if(sDir==0) snakeY[0]--; else if(sDir==1) snakeX[0]++; 
+    else if(sDir==2) snakeY[0]++; else if(sDir==3) snakeX[0]--;
+    
+    // 吃食物判定
+    if(snakeX[0] == foodX && snakeY[0] == foodY) {
+      snakeLen++; foodX = random(2, 30); foodY = random(2, 22);
+      playSound(2000, 50, 15); triggerVibration(2, 60);
+    }
+    
+    // 繪製
+    for(int i=0; i<snakeLen; i++) tft.fillRect(snakeX[i]*10, snakeY[i]*10, 9, 9, (i==0)?TFT_GREEN:0x03E0);
+    tft.fillRect(foodX*10, foodY*10, 9, 9, TFT_RED);
+    
+    // 死亡判定
+    if(snakeX[0]<0 || snakeX[0]>31 || snakeY[0]<0 || snakeY[0]>23) {
+      playSound(150, 500, 15); triggerVibration(2, 500);
+      initSnake();
+    }
+    lastSnakeMove = millis();
+  }
+  drawExitButton();
+}
+
+// ==========================================
+// 8. 俄羅斯方塊 (Tetris) - 完整未簡化版
+// ==========================================
+uint8_t grid[20][10];
+int curPiece, curRot, curX, curY;
+unsigned long lastFall = 0;
+const uint16_t tetColors[] = {TFT_BLACK, TFT_CYAN, TFT_YELLOW, 0x801F, TFT_GREEN, TFT_RED, TFT_BLUE, 0xFD20};
+const uint16_t shapes[7][4] = {
+  {0x0F00,0x2222,0x00F0,0x4444}, {0x0660,0x0660,0x0660,0x0660}, {0x0E40,0x4C40,0x4E00,0x8C80},
+  {0x06C0,0x8C40,0x06C0,0x8C40}, {0x0C60,0x4C80,0x0C60,0x4C80}, {0x0E80,0xC440,0x2E00,0x88C0},
+  {0x0E20,0x44C0,0x8E00,0xC880}
+};
+
+void initTetris() { memset(grid, 0, sizeof(grid)); tft.fillScreen(TFT_BLACK); spawnPiece(); }
+void spawnPiece() { curPiece = random(0,7); curRot = 0; curX = 3; curY = 0; }
+
+bool checkCollision(int nx, int ny, int nr) {
+  for(int i=0; i<4; i++) for(int j=0; j<4; j++) {
+    if((shapes[curPiece][nr] >> (15-(i*4+j))) & 1) {
+      int px = nx + j, py = ny + i;
+      if(px<0 || px>=10 || py>=20 || (py>=0 && grid[py][px])) return true;
+    }
+  }
+  return false;
+}
+
+void playTetris() {
+  if (v_lz == LOW || btn_b == HIGH) { gameState = 0; delay(300); return; }
+  
+  if (v_lx < 1000 && !checkCollision(curX-1, curY, curRot)) { curX--; delay(100); }
+  if (v_lx > 3000 && !checkCollision(curX+1, curY, curRot)) { curX++; delay(100); }
+  if (v_ly > 3000 && !checkCollision(curX, curY+1, curRot)) { curY++; delay(50); }
+  if (v_ry < 1000) { 
+    int nextR = (curRot+1)%4; 
+    if(!checkCollision(curX, curY, nextR)) { curRot = nextR; playSound(1500, 20, 5); } 
+    delay(200); 
+  }
+
+  if (millis() - lastFall > 600) {
+    if(!checkCollision(curX, curY+1, curRot)) curY++;
+    else {
+      for(int i=0; i<4; i++) for(int j=0; j<4; j++) 
+        if((shapes[curPiece][curRot]>>(15-(i*4+j)))&1) grid[curY+i][curX+j] = curPiece+1;
+      
+      // 消行與音效震動
+      for(int i=0; i<20; i++) { 
+        bool full=true; for(int j=0; j<10; j++) if(!grid[i][j]) full=false; 
+        if(full) { 
+          for(int k=i; k>0; k--) memcpy(grid[k], grid[k-1], 10); memset(grid[0],0,10); 
+          playSound(800, 150, 15); triggerVibration(2, 100); 
+        } 
+      }
+      spawnPiece(); if(checkCollision(curX, curY, curRot)) initTetris();
+    }
+    lastFall = millis();
+  }
+  
+  // 繪製網格
+  for(int i=0; i<20; i++) for(int j=0; j<10; j++) 
+    tft.fillRect(110+j*11, i*12, 10, 11, tetColors[grid[i][j]]);
+  // 繪製當前方塊
+  for(int i=0; i<4; i++) for(int j=0; j<4; j++) 
+    if((shapes[curPiece][curRot]>>(15-(i*4+j)))&1) tft.fillRect(110+(curX+j)*11, (curY+i)*12, 10, 11, tetColors[curPiece+1]);
+  
+  drawExitButton();
+}
+
+// ==========================================
+// 9. 五子棋 (Gomoku) - 完整未簡化版
+// ==========================================
+int gb[15][15], gx, gy;
+void initGomoku() {
+  memset(gb, 0, sizeof(gb)); gx=7; gy=7;
+  tft.fillScreen(0xFDA0); 
+  for(int i=0; i<15; i++) { tft.drawFastHLine(20, 20+i*14, 196, TFT_BLACK); tft.drawFastVLine(20+i*14, 20, 196, TFT_BLACK); }
+}
+void playGomoku() {
+  if (v_lz == LOW || btn_b == HIGH) { gameState = 0; delay(300); return; }
+  // 游標邏輯
+  if (millis() - lastAction > 150) {
+    if(v_lx < 1000) gx = max(0, gx-1); else if(v_lx > 3000) gx = min(14, gx+1);
+    if(v_ly < 1000) gy = max(0, gy-1); else if(v_ly > 3000) gy = min(14, gy+1);
+    lastAction = millis();
+  }
+  // 繪製棋子與游標
+  for(int i=0; i<15; i++) for(int j=0; j<15; j++) {
+    if(gb[i][j]==1) tft.fillCircle(20+j*14, 20+i*14, 5, TFT_BLACK);
+    if(gb[i][j]==2) tft.fillCircle(20+j*14, 20+i*14, 5, TFT_WHITE);
+  }
+  tft.drawRect(20+gx*14-6, 20+gy*14-6, 12, 12, TFT_RED); // 游標
+  
+  if((btn_a == HIGH) && gb[gy][gx] == 0) {
+    gb[gy][gx] = 1; playSound(1200, 50, 10); delay(300);
+    // 基礎 AI 落子
+    for(int i=0; i<15; i++) for(int j=0; j<15; j++) if(gb[i][j]==0) { gb[i][j]=2; return; }
+  }
+  drawExitButton();
+}// ==========================================
+// 10. 主選單繪製與選擇邏輯 (完整不簡化)
+// ==========================================
+void handleMenu() {
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawCentreString("STAR OS 5-IN-1", 160, 15, 4);
+  
+  // 繪製五個遊戲選擇框
+  drawBox(55,  "1. FIGHTER (1-10 LV)", menuIndex == 0);
+  drawBox(92,  "2. PONG (CLASSIC)",    menuIndex == 1);
+  drawBox(129, "3. SNAKE (RETRO)",      menuIndex == 2);
+  drawBox(166, "4. TETRIS (BLOCKS)",    menuIndex == 3);
+  drawBox(203, "5. GOMOKU (AI)",        menuIndex == 4);
+
+  // 選單搖桿操作與音效
+  if (millis() - lastAction > 200) {
+    if (v_ly < 1000 && menuIndex > 0) {
+      menuIndex--;
+      playSound(1200, 30, 5); // 切換音效
+      lastAction = millis();
+    } else if (v_ly > 3000 && menuIndex < 4) {
+      menuIndex++;
+      playSound(1000, 30, 5); // 切換音效
+      lastAction = millis();
+    }
+    
+    // 進入遊戲判斷 (支援 L_Z 與 BTN_A)
+    if (v_lz == LOW || btn_a == HIGH) {
+      playSound(2200, 100, 10);
+      triggerVibration(2, 50); // 啟動震動
+      tft.fillScreen(TFT_BLACK);
+      
+      if (menuIndex == 0) { gameState = 2; initFighter(); }
+      else if (menuIndex == 1) { gameState = 3; initPong(); }
+      else if (menuIndex == 2) { gameState = 4; initSnake(); }
+      else if (menuIndex == 3) { gameState = 5; initTetris(); }
+      else if (menuIndex == 4) { gameState = 6; initGomoku(); }
+      
+      delay(300);
+      lastAction = millis();
+    }
+  }
+}
+
+// ==========================================
+// 11. 系統初始化 (Setup)
+// ==========================================
+void setup() {
+  Serial.begin(115200);
+  
+  // 螢幕初始化與方向
+  tft.init();
+  tft.setRotation(1);
+  tft.fillScreen(TFT_BLACK);
+  
+  // 硬體腳位模式 (嚴格對應輸入輸出)
+  pinMode(L_Z, INPUT_PULLUP);
+  pinMode(R_Z, INPUT_PULLUP);
+  pinMode(BTN_A, INPUT_PULLDOWN);
+  pinMode(BTN_B, INPUT_PULLDOWN);
+  pinMode(MOTOR_R, OUTPUT);
+  pinMode(MOTOR_L, OUTPUT);
+  
+  // PWM 音效通道綁定
+  ledcAttach(BUZZER_PIN, AUDIO_FREQ, AUDIO_RES);
+  
+  // 初始化隨機種子
+  randomSeed(analogRead(36));
+  
+  // 開機畫面
+  tft.setTextColor(TFT_CYAN);
+  tft.drawCentreString("SYSTEM BOOTING...", 160, 100, 2);
+  delay(800);
+  tft.fillScreen(TFT_BLACK);
+}
+
+// ==========================================
+// 12. 系統主循環 (Loop) - 核心節拍器
+// ==========================================
+void loop() {
+  // 嚴格控制更新頻率，確保馬達與音效不因 CPU 速度改變長度
+  if (millis() - lastFrameTime >= frameDelay) {
+    lastFrameTime = millis();
+
+    // 硬體後台更新 (處理定時關閉)
+    updateAudio();
+    updateMotors();
+
+    // 讀取所有感測器與按鈕數值
+    v_lx = analogRead(L_X);
+    v_ly = analogRead(L_Y);
+    v_lz = digitalRead(L_Z);
+    v_rx = analogRead(R_X);
+    v_ry = analogRead(R_Y);
+    v_rz = digitalRead(R_Z);
+    btn_a = digitalRead(BTN_A);
+    btn_b = digitalRead(BTN_B);
+
+    // 觸控退出系統 (點擊右上角)
+    uint16_t tx, ty;
+    if (tft.getTouch(&tx, &ty)) {
+      if (gameState != 0 && tx > 280 && ty < 40) {
+        gameState = 0;
+        tft.fillScreen(TFT_BLACK);
+        playSound(400, 100, 5);
+        delay(300);
+      }
+    }
+
+    // 遊戲狀態機控制
+    switch (gameState) {
+      case 0: handleMenu();   break; // 主選單
+      case 2: playFighter();  break; // 升級後的 1-10 關戰機
+      case 3: playPong();     break; // 乒乓球
+      case 4: playSnake();    break; // 貪食蛇
+      case 5: playTetris();   break; // 俄羅斯方塊
+      case 6: playGomoku();   break; // 五子棋
+    }
+  }
+}
