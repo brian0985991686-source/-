@@ -1,0 +1,168 @@
+#include <Arduino.h>
+#include <IRremote.hpp>
+#include <MD_MAX72xx.h>
+#include <SPI.h>
+
+// --- 1. 腳位與參數 ---
+#define IR_RECEIVE_PIN 15
+#define TRIG_PIN 4
+#define ECHO_PIN 16
+#define FAN_PIN 19
+#define BUZZER_PIN 17   // 使用 GPIO 17，避開開機閃爍腳位
+
+const int ENA = 14; const int IN1 = 12; const int IN2 = 13;
+const int ENB = 27; const int IN3 = 26; const int IN4 = 25;
+
+float RIGHT_WHEEL_CORRECTION = 0.70;
+bool wasStopped = true;
+
+#define HARDWARE_TYPE MD_MAX72XX::FC16_HW 
+#define MAX_DEVICES 1
+#define CS_PIN 5
+MD_MAX72XX mx = MD_MAX72XX(HARDWARE_TYPE, 23, 18, CS_PIN, MAX_DEVICES);
+
+volatile enum RobotMode { SLEEP, MANUAL, TRACKING } currentMode = SLEEP; 
+volatile enum Emotion { EM_HEART, EM_HAPPY, EM_ANGRY, EM_SAD, EM_NONE } currentEmotion = EM_NONE;
+volatile bool isMuted = false;
+
+TaskHandle_t TaskPerform;
+
+// --- 2. 蜂鳴器：高阻抗切換靜音法 ---
+void playTone(int freq, int duration) {
+  if (isMuted || freq <= 0) { 
+    pinMode(BUZZER_PIN, INPUT); // 靜音時切換為輸入模式，徹底斷流
+    return; 
+  }
+  
+  // 要發聲時才切換為輸出並綁定 PWM
+  pinMode(BUZZER_PIN, OUTPUT);
+  ledcAttach(BUZZER_PIN, 2000, 8); 
+  ledcWriteTone(BUZZER_PIN, freq);
+  ledcWrite(BUZZER_PIN, 127); // 最大音量
+  
+  delay(duration);
+  
+  // 發聲結束立刻變回高阻抗模式，防止嗡嗡聲
+  ledcWrite(BUZZER_PIN, 255); 
+  ledcWriteTone(BUZZER_PIN, 0); 
+  pinMode(BUZZER_PIN, INPUT); 
+}
+
+void playHappySound() { for (int i = 800; i < 2200; i += 400) { playTone(i, 70); delay(20); } }
+void playAngrySound() { for (int i = 500; i > 200; i -= 50) { playTone(i, 120); delay(30); } playTone(160, 450); }
+void playSadSound() { for (int i = 1100; i > 300; i -= 40) { playTone(i, 40); delay(15); } }
+
+void draw(const uint8_t face[]) { for (int i = 0; i < 8; i++) mx.setRow(0, i, face[i]); }
+
+// --- 3. Core 0：處理動畫與環境維護 ---
+void PerformanceTask(void * pvParameters) {
+  for(;;) {
+    if (currentMode != SLEEP) {
+      unsigned long now = millis();
+      static unsigned long lastAnimTime = 0;
+      static bool animState = false;
+      const uint8_t heartBig[8]   = {0x00, 0x66, 0xFF, 0xFF, 0xFF, 0x7E, 0x3C, 0x18};
+      const uint8_t heartSmall[8] = {0x00, 0x00, 0x24, 0x7E, 0x3C, 0x18, 0x00, 0x00};
+      const uint8_t happyOpen[8]  = {0x00, 0x42, 0x00, 0x00, 0x81, 0x42, 0x3C, 0x00}; 
+      const uint8_t happyBlink[8] = {0x00, 0x00, 0x42, 0x00, 0x81, 0x42, 0x3C, 0x00}; 
+      const uint8_t angryFace[8]  = {0xC3, 0x42, 0x00, 0x00, 0x00, 0x3C, 0x42, 0x00};
+      const uint8_t sadFace[8]    = {0x00, 0x00, 0x00, 0x66, 0x00, 0x3C, 0x42, 0x81};
+      
+      if (currentEmotion == EM_HEART) { if (now - lastAnimTime > 500) { lastAnimTime = now; animState = !animState; draw(animState ? heartBig : heartSmall); } }
+      else if (currentEmotion == EM_HAPPY) { if (animState) { if (now - lastAnimTime > 150) { animState = false; lastAnimTime = now; draw(happyOpen); } } else { if (now - lastAnimTime > 3000) { animState = true; lastAnimTime = now; draw(happyBlink); } } }
+      else if (currentEmotion == EM_ANGRY) { draw(angryFace); }
+      else if (currentEmotion == EM_SAD) { draw(sadFace); }
+    } else {
+      // 睡眠模式下，確保蜂鳴器完全切斷
+      pinMode(BUZZER_PIN, INPUT);
+    }
+    vTaskDelay(10); 
+  }
+}
+
+// --- 4. Core 1：動力控制 ---
+void motorCtrl(int speedL, int speedR) {
+  if (currentMode == SLEEP) return;
+  if (wasStopped && (speedL != 0 || speedR != 0)) {
+    int kickTime = 80; if (speedR > 0) kickTime = 180;
+    analogWrite(ENA, 255); analogWrite(ENB, 255); delay(kickTime); wasStopped = false;
+  }
+  if (speedL == 0 && speedR == 0) wasStopped = true;
+  int adjR = constrain((int)(speedR * RIGHT_WHEEL_CORRECTION), -255, 255);
+  if (speedL >= 0) { digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW); } else { digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH); speedL = -speedL; }
+  analogWrite(ENA, speedL);
+  if (adjR >= 0) { digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW); } else { digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH); adjR = -adjR; }
+  analogWrite(ENB, adjR);
+}
+
+void allStop() {
+  analogWrite(ENA, 0); analogWrite(ENB, 0);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+  digitalWrite(FAN_PIN, LOW); 
+  pinMode(BUZZER_PIN, INPUT); // 停止時立刻切斷電流
+  wasStopped = true;
+}
+
+long getDistance() {
+  digitalWrite(TRIG_PIN, LOW); delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000); 
+  return (duration == 0) ? 999 : (duration * 0.034 / 2);
+}
+
+void setup() {
+  // 開機瞬間設為 INPUT，防止亂叫
+  pinMode(BUZZER_PIN, INPUT);
+  
+  Serial.begin(115200);
+  
+  IrReceiver.begin(IR_RECEIVE_PIN, ENABLE_LED_FEEDBACK);
+  pinMode(TRIG_PIN, OUTPUT); pinMode(ECHO_PIN, INPUT); pinMode(FAN_PIN, OUTPUT);
+  pinMode(ENA, OUTPUT); pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(ENB, OUTPUT); pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  
+  mx.begin(); mx.control(MD_MAX72XX::INTENSITY, 2); mx.clear();
+  
+  xTaskCreatePinnedToCore(PerformanceTask, "TaskPerform", 4096, NULL, 1, &TaskPerform, 0);
+  
+  // 測試開機音（會自動切換為輸出再切回輸入）
+  playTone(1500, 100); delay(50); playTone(2000, 200);
+}
+
+void loop() {
+  if (IrReceiver.decode()) {
+    uint32_t code = IrReceiver.decodedIRData.decodedRawData;
+    if (!(IrReceiver.decodedIRData.flags & IRDATA_FLAGS_IS_REPEAT)) {
+      if (code == 0xBA45FF00) { 
+        isMuted = !isMuted; 
+        if (!isMuted) playTone(1800, 100); 
+        else pinMode(BUZZER_PIN, INPUT); 
+      }
+      if (code == 0xB847FF00) { currentMode = MANUAL; currentEmotion = EM_HEART; playTone(1200, 200); } 
+      else if (code == 0xB946FF00) { currentMode = SLEEP; allStop(); mx.clear(); }
+      
+      if (currentMode != SLEEP) {
+        if (code == 0xE718FF00) { motorCtrl(255, 255); } 
+        else if (code == 0xAD52FF00) { motorCtrl(-255, -255); } 
+        else if (code == 0xA55AFF00) { motorCtrl(-200, 200); } 
+        else if (code == 0xF708FF00) { motorCtrl(200, -200); }  
+        else if (code == 0xE916FF00) { currentEmotion = EM_HAPPY; digitalWrite(FAN_PIN, HIGH); playHappySound(); } 
+        else if (code == 0xE619FF00) { currentEmotion = EM_ANGRY; digitalWrite(FAN_PIN, LOW); playAngrySound(); } 
+        else if (code == 0xF20DFF00) { currentEmotion = EM_HEART; digitalWrite(FAN_PIN, LOW); } 
+        else if (code == 0xE31CFF00) { currentMode = TRACKING; playTone(1800, 100); } 
+      }
+    }
+    IrReceiver.resume();
+  }
+  
+  if (currentMode == TRACKING) {
+    long dist = getDistance();
+    if (dist > 150) { currentEmotion = EM_HAPPY; motorCtrl(180, 180); } 
+    else if (dist > 60 && dist <= 150) { currentEmotion = EM_SAD; motorCtrl(230, 230); } 
+    else if (dist < 25) { currentEmotion = EM_ANGRY; motorCtrl(-200, -200); } 
+    else { currentEmotion = EM_HEART; motorCtrl(0, 0); }
+    delay(50); 
+  }
+}
