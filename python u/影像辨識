@@ -1,0 +1,127 @@
+import cv2
+import math
+import numpy as np
+import mediapipe as mp
+
+# -----------------------------
+# 初始化 MediaPipe 與攝影機
+# -----------------------------
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(
+    max_num_hands=2,
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.7
+)
+
+cap = cv2.VideoCapture(0)
+width, height = 640, 480
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+
+
+# -----------------------------
+# 能量光團繪製函數 (含光暈與電光特效)
+# -----------------------------
+def draw_energy_ball(img, center, radius, color_bgr, is_purple=False):
+    x, y = center
+    overlay = img.copy()
+
+    # 1. 多層半透明外暈
+    for r in range(4, 0, -1):
+        cv2.circle(overlay, (x, y), int(radius * (1 + r * 0.4)), color_bgr, -1)
+    cv2.addWeighted(overlay, 0.35, img, 0.65, 0, img)
+
+    # 2. 核心光團與白色高亮心
+    cv2.circle(img, (x, y), radius, color_bgr, -1)
+    cv2.circle(img, (x, y), int(radius * 0.4), (255, 255, 255), -1)
+
+    # 3. 散發能量電光粒子
+    spark_count = 14 if is_purple else 7
+    max_dist = radius * 2.5 if is_purple else radius * 1.8
+    for _ in range(spark_count):
+        angle = np.random.uniform(0, 2 * math.pi)
+        dist = np.random.uniform(radius, max_dist)
+        ex = int(x + math.cos(angle) * dist)
+        ey = int(y + math.sin(angle) * dist)
+        cv2.line(img, (x, y), (ex, ey), (255, 255, 255), 2)
+
+
+# -----------------------------
+# 主程式迴圈
+# -----------------------------
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret or frame is None:
+        continue
+
+    # 鏡像翻轉 (符合真實鏡子視覺)
+    frame = cv2.flip(frame, 1)
+    h, w, _ = frame.shape
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    rgb.flags.writeable = False
+    results = hands.process(rgb)
+    rgb.flags.writeable = True
+
+    hand_info = []
+
+    if results.multi_hand_landmarks and results.multi_handedness:
+        for hand_lms, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
+            # 取出左右手標籤 (鏡像後：Left畫面選單為右手，Right選單為左手)
+            label = handedness.classification[0].label
+
+            # 計算掌心中心座標 (取中指根部 9 號關鍵點)
+            cx = int(hand_lms.landmark[9].x * w)
+            cy = int(hand_lms.landmark[9].y * h)
+
+            hand_info.append({"pos": (cx, cy), "label": label})
+
+    # -----------------------------
+    # 雙手距離判斷與特效渲染
+    # -----------------------------
+    if len(hand_info) == 2:
+        p1, p2 = hand_info[0]["pos"], hand_info[1]["pos"]
+        distance = math.hypot(p1[0] - p2[0], p1[1] - p2[1])
+
+        # 當兩手光團靠近 (距離小於 110 像素) -> 融合為大紫團「茈」
+        if distance < 110:
+            mid_x = (p1[0] + p2[0]) // 2
+            mid_y = (p1[1] + p2[1]) // 2
+            draw_energy_ball(frame, (mid_x, mid_y), 75, (255, 0, 180), is_purple=True)
+            cv2.putText(frame, "HOLLOW PURPLE!!", (mid_x - 130, mid_y - 100),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 255), 3)
+        else:
+            # 距離較遠時，兩手各自產生「蒼」與「赫」
+            for hand in hand_info:
+                pos = hand["pos"]
+                if hand["label"] == "Right":  # 畫面右手 -> 赫 (紅)
+                    draw_energy_ball(frame, pos, 35, (50, 50, 255))
+                    cv2.putText(frame, "AKA (Red)", (pos[0] - 50, pos[1] - 55),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                else:  # 畫面左手 -> 蒼 (藍)
+                    draw_energy_ball(frame, pos, 35, (255, 180, 0))
+                    cv2.putText(frame, "AOI (Blue)", (pos[0] - 50, pos[1] - 55),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 200, 0), 2)
+
+    elif len(hand_info) == 1:
+        # 單手舉起時顯示對應光團
+        hand = hand_info[0]
+        pos = hand["pos"]
+        if hand["label"] == "Right":
+            draw_energy_ball(frame, pos, 35, (50, 50, 255))
+            cv2.putText(frame, "AKA (Red)", (pos[0] - 50, pos[1] - 55),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        else:
+            draw_energy_ball(frame, pos, 35, (255, 180, 0))
+            cv2.putText(frame, "AOI (Blue)", (pos[0] - 50, pos[1] - 55),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 200, 0), 2)
+
+    # 顯示視訊與提示
+    cv2.putText(frame, "ESC: Exit", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+    cv2.imshow("Jujutsu Kaisen - Limitless Technique", frame)
+
+    if cv2.waitKey(1) & 0xFF == 27:
+        break
+
+cap.release()
+cv2.destroyAllWindows()
