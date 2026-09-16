@@ -1,0 +1,1436 @@
+
+#define LGFX_USE_V1
+
+#include <LovyanGFX.hpp>
+#include "LGFX_ESP32S3_ILI9341.h"
+
+LGFX lcd;
+
+#include <Arduino.h>
+#include <SPI.h>
+#include <SD.h>
+#include <Audio.h>
+
+LGFX_Sprite dnaSprite(&lcd);
+LGFX_Sprite loadSprite(&lcd);
+
+
+// ======================================================
+// SD 卡
+// ======================================================
+#define SD_CS    1
+#define SD_MOSI  2
+#define SD_MISO  41
+#define SD_SCK   42
+
+SPIClass sdSPI(HSPI);
+
+
+// ======================================================
+// I2S
+// ======================================================
+#define I2S_BCLK 16
+#define I2S_LRC  15
+#define I2S_DOUT 17
+
+Audio audio;
+
+
+// ======================================================
+// JPG 開機動畫
+// ======================================================
+#define FRAME_COUNT 34
+
+// 每張 JPG 顯示約 12.5ms
+#define FRAME_DELAY_US 12500
+
+
+// ======================================================
+// 最終動畫更新
+// ======================================================
+#define FINAL_FRAME_MS 33
+
+
+// ======================================================
+// Loading
+// ======================================================
+#define LOADING_TIME_MS 3000
+
+
+// ======================================================
+// DNA 區域
+// ======================================================
+#define DNA_X 28
+#define DNA_Y 88
+#define DNA_W 286
+#define DNA_H 80
+
+
+// ======================================================
+// Loading 區域
+// ======================================================
+#define LOAD_X 168
+#define LOAD_Y 24
+#define LOAD_W 145
+#define LOAD_H 24
+
+
+// ======================================================
+// BMP Buffer
+// ======================================================
+uint8_t *bmpBuffer = nullptr;
+size_t bmpBufferSize = 0;
+
+
+// ======================================================
+// 顯示 JPG
+// ======================================================
+bool showJPG(
+    const char *filename
+)
+{
+    File jpgFile =
+        SD.open(
+            filename,
+            FILE_READ
+        );
+
+    if (!jpgFile)
+    {
+        Serial.print(
+            "[ERROR] Cannot open JPG: "
+        );
+
+        Serial.println(
+            filename
+        );
+
+        return false;
+    }
+
+
+    size_t fileSize =
+        jpgFile.size();
+
+
+    uint8_t *jpgBuf =
+        (uint8_t *)ps_malloc(
+            fileSize
+        );
+
+
+    if (jpgBuf == nullptr)
+    {
+        jpgBuf =
+            (uint8_t *)malloc(
+                fileSize
+            );
+    }
+
+
+    if (jpgBuf == nullptr)
+    {
+        jpgFile.close();
+
+        Serial.println(
+            "[ERROR] JPG buffer allocation failed"
+        );
+
+        return false;
+    }
+
+
+    size_t bytesRead =
+        jpgFile.read(
+            jpgBuf,
+            fileSize
+        );
+
+
+    jpgFile.close();
+
+
+    if (bytesRead != fileSize)
+    {
+        free(
+            jpgBuf
+        );
+
+        Serial.println(
+            "[ERROR] JPG read failed"
+        );
+
+        return false;
+    }
+
+
+    // --------------------------------------------------
+    // 顯示 JPG
+    // --------------------------------------------------
+    lcd.drawJpg(
+        jpgBuf,
+        fileSize,
+        0,
+        0
+    );
+
+
+    free(
+        jpgBuf
+    );
+
+
+    return true;
+}
+
+
+// ======================================================
+// 建立 DNA 背景
+//
+// 使用 LovyanGFX BMP Decoder
+// ======================================================
+bool createDNABackground()
+{
+    if (
+        bmpBuffer == nullptr
+    )
+    {
+        Serial.println(
+            "[ERROR] BMP buffer is null"
+        );
+
+        return false;
+    }
+
+
+    // --------------------------------------------------
+    // 清除 Sprite
+    // --------------------------------------------------
+    dnaSprite.fillSprite(
+        TFT_BLACK
+    );
+
+
+    // --------------------------------------------------
+    // BMP 直接解碼到 Sprite
+    // --------------------------------------------------
+    dnaSprite.drawBmp(
+        bmpBuffer,
+        bmpBufferSize,
+        -DNA_X,
+        -DNA_Y
+    );
+
+
+    return true;
+}
+
+
+// ======================================================
+// 建立 Loading 背景
+// ======================================================
+bool createLoadingBackground()
+{
+    if (
+        bmpBuffer == nullptr
+    )
+    {
+        Serial.println(
+            "[ERROR] BMP buffer is null"
+        );
+
+        return false;
+    }
+
+
+    loadSprite.fillSprite(
+        TFT_BLACK
+    );
+
+
+    loadSprite.drawBmp(
+        bmpBuffer,
+        bmpBufferSize,
+        -LOAD_X,
+        -LOAD_Y
+    );
+
+
+    return true;
+}
+
+
+// ======================================================
+// 載入 test.bmp
+// ======================================================
+bool loadTestBMP()
+{
+    File bmpFile =
+        SD.open(
+            "/GIF/test.bmp",
+            FILE_READ
+        );
+
+
+    if (!bmpFile)
+    {
+        Serial.println(
+            "[ERROR] Cannot open /GIF/test.bmp"
+        );
+
+        return false;
+    }
+
+
+    bmpBufferSize =
+        bmpFile.size();
+
+
+    // --------------------------------------------------
+    // 配置 PSRAM
+    // --------------------------------------------------
+    bmpBuffer =
+        (uint8_t *)ps_malloc(
+            bmpBufferSize
+        );
+
+
+    if (
+        bmpBuffer == nullptr
+    )
+    {
+        bmpBuffer =
+            (uint8_t *)malloc(
+                bmpBufferSize
+            );
+    }
+
+
+    if (
+        bmpBuffer == nullptr
+    )
+    {
+        bmpFile.close();
+
+        Serial.println(
+            "[ERROR] BMP buffer allocation failed"
+        );
+
+        return false;
+    }
+
+
+    // --------------------------------------------------
+    // 讀檔
+    // --------------------------------------------------
+    size_t bytesRead =
+        bmpFile.read(
+            bmpBuffer,
+            bmpBufferSize
+        );
+
+
+    bmpFile.close();
+
+
+    if (
+        bytesRead != bmpBufferSize
+    )
+    {
+        free(
+            bmpBuffer
+        );
+
+
+        bmpBuffer =
+            nullptr;
+
+
+        bmpBufferSize =
+            0;
+
+
+        Serial.println(
+            "[ERROR] BMP read failed"
+        );
+
+
+        return false;
+    }
+
+
+    // ==================================================
+    // BMP Header
+    // ==================================================
+    uint16_t signature =
+        *(uint16_t *)(bmpBuffer + 0);
+
+
+    uint32_t dataOffset =
+        *(uint32_t *)(bmpBuffer + 10);
+
+
+    int32_t bmpWidth =
+        *(int32_t *)(bmpBuffer + 18);
+
+
+    int32_t bmpHeight =
+        *(int32_t *)(bmpBuffer + 22);
+
+
+    uint16_t bitsPerPixel =
+        *(uint16_t *)(bmpBuffer + 28);
+
+
+    uint32_t compression =
+        *(uint32_t *)(bmpBuffer + 30);
+
+
+    // ==================================================
+    // BMP 資訊
+    // ==================================================
+    Serial.println();
+    Serial.println(
+        "===== BMP INFO ====="
+    );
+
+
+    Serial.print(
+        "File Size: "
+    );
+
+    Serial.println(
+        (uint32_t)bmpBufferSize
+    );
+
+
+    Serial.print(
+        "Width: "
+    );
+
+    Serial.println(
+        bmpWidth
+    );
+
+
+    Serial.print(
+        "Height: "
+    );
+
+    Serial.println(
+        bmpHeight
+    );
+
+
+    Serial.print(
+        "Bits Per Pixel: "
+    );
+
+    Serial.println(
+        bitsPerPixel
+    );
+
+
+    Serial.print(
+        "Compression: "
+    );
+
+    Serial.println(
+        compression
+    );
+
+
+    Serial.print(
+        "Data Offset: "
+    );
+
+    Serial.println(
+        dataOffset
+    );
+
+
+    Serial.print(
+        "Free Heap: "
+    );
+
+    Serial.println(
+        ESP.getFreeHeap()
+    );
+
+
+    Serial.print(
+        "Free PSRAM: "
+    );
+
+    Serial.println(
+        ESP.getFreePsram()
+    );
+
+
+    Serial.println(
+        "===================="
+    );
+
+
+    // ==================================================
+    // BMP 檢查
+    // ==================================================
+    if (
+        signature != 0x4D42
+    )
+    {
+        Serial.println(
+            "[ERROR] Not a BMP file"
+        );
+
+
+        free(
+            bmpBuffer
+        );
+
+
+        bmpBuffer =
+            nullptr;
+
+
+        bmpBufferSize =
+            0;
+
+
+        return false;
+    }
+
+
+    if (
+        bmpWidth != 320
+    )
+    {
+        Serial.println(
+            "[WARNING] BMP width is not 320"
+        );
+    }
+
+
+    if (
+        abs(bmpHeight) != 240
+    )
+    {
+        Serial.println(
+            "[WARNING] BMP height is not 240"
+        );
+    }
+
+
+    if (
+        bitsPerPixel != 24
+    )
+    {
+        Serial.println(
+            "[ERROR] BMP is not 24-bit"
+        );
+
+
+        free(
+            bmpBuffer
+        );
+
+
+        bmpBuffer =
+            nullptr;
+
+
+        bmpBufferSize =
+            0;
+
+
+        return false;
+    }
+
+
+    if (
+        compression != 0
+    )
+    {
+        Serial.println(
+            "[ERROR] BMP compression != 0"
+        );
+
+
+        free(
+            bmpBuffer
+        );
+
+
+        bmpBuffer =
+            nullptr;
+
+
+        bmpBufferSize =
+            0;
+
+
+        return false;
+    }
+
+
+    // ==================================================
+    // 顯示原始 BMP
+    // ==================================================
+    lcd.drawBmp(
+        bmpBuffer,
+        bmpBufferSize,
+        0,
+        0
+    );
+
+
+    return true;
+}
+
+
+// ======================================================
+// 開機動畫 + 開機音效
+// ======================================================
+void playAnimation()
+{
+    Serial.println(
+        "[BOOT] Starting boot sound..."
+    );
+
+
+    // --------------------------------------------------
+    // 播放科技感開機音效
+    // --------------------------------------------------
+    audio.setVolume(
+        15
+    );
+
+
+    audio.connecttoFS(
+        SD,
+        "/GIF/boot.mp3"
+    );
+
+
+    char filename[40];
+
+
+    // ==================================================
+    // 播放 1.jpg ~ 34.jpg
+    // ==================================================
+    for (
+        int i = 1;
+        i <= FRAME_COUNT;
+        i++
+    )
+    {
+        snprintf(
+            filename,
+            sizeof(filename),
+            "/GIF/%d.jpg",
+            i
+        );
+
+
+        showJPG(
+            filename
+        );
+
+
+        uint32_t startTime =
+            micros();
+
+
+        // ------------------------------------------------
+        // JPG 播放期間持續解碼 MP3
+        // ------------------------------------------------
+        while (
+            micros() - startTime
+            <
+            FRAME_DELAY_US
+        )
+        {
+            audio.loop();
+        }
+    }
+
+
+    Serial.println(
+        "[BOOT] Boot animation finished."
+    );
+}
+
+
+// ======================================================
+// DNA 曲線
+// ======================================================
+float dnaCurve(
+    float x
+)
+{
+    const float amplitude =
+        21.0f;
+
+
+    const float frequency =
+        2.0f *
+        PI *
+        2.75f;
+
+
+    const float phase =
+        -0.50f;
+
+
+    return
+        sinf(
+            x *
+            frequency +
+            phase
+        )
+        *
+        amplitude;
+}
+
+
+// ======================================================
+// DNA 動畫
+//
+// 2 條粗曲線
+// 3 顆不規則球
+// ======================================================
+void updateDNA(
+    float time
+)
+{
+    // ==================================================
+    // 每一幀恢復 BMP 背景
+    // ==================================================
+    if (
+        !createDNABackground()
+    )
+    {
+        return;
+    }
+
+
+    const int xStart =
+        7;
+
+
+    const int xEnd =
+        263;
+
+
+    const float centerY =
+        29.0f;
+
+
+    // ==================================================
+    // DNA 移動速度
+    // ==================================================
+    const float curveSpeed =
+        0.12f;
+
+
+    float phaseOffset =
+        time *
+        curveSpeed;
+
+
+    // ==================================================
+    // 起始點
+    // ==================================================
+    int lastX =
+        xStart;
+
+
+    float wave0 =
+        dnaCurve(
+            phaseOffset
+        );
+
+
+    int lastY1 =
+        (int)(
+            centerY +
+            wave0
+        );
+
+
+    int lastY2 =
+        (int)(
+            centerY -
+            wave0
+        );
+
+
+    // ==================================================
+    // 兩條粗曲線
+    // ==================================================
+    for (
+        int x = xStart + 1;
+        x <= xEnd;
+        x++
+    )
+    {
+        float n =
+            (float)(
+                x - xStart
+            )
+            /
+            (float)(
+                xEnd - xStart
+            );
+
+
+        float wave =
+            dnaCurve(
+                n +
+                phaseOffset
+            );
+
+
+        int y1 =
+            (int)(
+                centerY +
+                wave
+            );
+
+
+        int y2 =
+            (int)(
+                centerY -
+                wave
+            );
+
+
+        // ------------------------------------------------
+        // 第一條
+        // ------------------------------------------------
+        dnaSprite.drawLine(
+            lastX,
+            lastY1,
+            x,
+            y1,
+            TFT_BLACK
+        );
+
+
+        dnaSprite.drawLine(
+            lastX,
+            lastY1 + 1,
+            x,
+            y1 + 1,
+            TFT_BLACK
+        );
+
+
+        // ------------------------------------------------
+        // 第二條
+        // ------------------------------------------------
+        dnaSprite.drawLine(
+            lastX,
+            lastY2,
+            x,
+            y2,
+            TFT_BLACK
+        );
+
+
+        dnaSprite.drawLine(
+            lastX,
+            lastY2 + 1,
+            x,
+            y2 + 1,
+            TFT_BLACK
+        );
+
+
+        lastX =
+            x;
+
+
+        lastY1 =
+            y1;
+
+
+        lastY2 =
+            y2;
+    }
+
+
+    // ==================================================
+    // 三顆球
+    // ==================================================
+    const float ballSpeed[3] =
+    {
+        0.075f,
+        0.053f,
+        0.091f
+    };
+
+
+    const float ballStart[3] =
+    {
+        0.10f,
+        0.47f,
+        0.78f
+    };
+
+
+    const float ballWobbleSpeed[3] =
+    {
+        1.10f,
+        0.73f,
+        1.37f
+    };
+
+
+    const float ballWobbleAmount[3] =
+    {
+        2.8f,
+        3.6f,
+        2.2f
+    };
+
+
+    for (
+        int i = 0;
+        i < 3;
+        i++
+    )
+    {
+        float pos =
+            ballStart[i] +
+            time *
+            ballSpeed[i];
+
+
+        pos =
+            fmodf(
+                pos,
+                1.0f
+            );
+
+
+        if (
+            pos < 0.0f
+        )
+        {
+            pos += 1.0f;
+        }
+
+
+        float wave =
+            dnaCurve(
+                pos +
+                phaseOffset
+            );
+
+
+        float wobble =
+            sinf(
+                time *
+                ballWobbleSpeed[i]
+                +
+                i *
+                2.37f
+            )
+            *
+            ballWobbleAmount[i];
+
+
+        float x =
+            xStart +
+            pos *
+            (xEnd - xStart);
+
+
+        float y =
+            centerY +
+            wave +
+            wobble;
+
+
+        dnaSprite.fillCircle(
+            (int)x,
+            (int)y,
+            4,
+            TFT_BLACK
+        );
+    }
+
+
+    // ==================================================
+    // 一次推送到 LCD
+    // ==================================================
+    dnaSprite.pushSprite(
+        DNA_X,
+        DNA_Y
+    );
+}
+
+
+// ======================================================
+// Loading Bar
+// ======================================================
+void updateLoadingBar(
+    uint32_t elapsed
+)
+{
+    // ==================================================
+    // 每一幀恢復原始背景
+    // ==================================================
+    if (
+        !createLoadingBackground()
+    )
+    {
+        return;
+    }
+
+
+    // ==================================================
+    // Loading Bar
+    //
+    // 比原本小
+    // 往上約 1 pixel
+    // ==================================================
+    const int barX =
+        8;
+
+
+    const int barY =
+        4;
+
+
+    const int barW =
+        128;
+
+
+    const int barH =
+        12;
+
+
+    // ==================================================
+    // 進度
+    // ==================================================
+    float progress =
+        (float)elapsed /
+        (float)LOADING_TIME_MS;
+
+
+    if (
+        progress < 0.0f
+    )
+    {
+        progress =
+            0.0f;
+    }
+
+
+    if (
+        progress > 1.0f
+    )
+    {
+        progress =
+            1.0f;
+    }
+
+
+    int fillW =
+        (int)(
+            (barW - 4) *
+            progress
+        );
+
+
+    // ==================================================
+    // 黑色進度
+    // ==================================================
+    if (
+        fillW > 0
+    )
+    {
+        loadSprite.fillRect(
+            barX + 2,
+            barY + 2,
+            fillW,
+            barH - 4,
+            TFT_BLACK
+        );
+    }
+
+
+    // ==================================================
+    // 一次推送
+    // ==================================================
+    loadSprite.pushSprite(
+        LOAD_X,
+        LOAD_Y
+    );
+}
+
+
+// ======================================================
+// Sprite 初始化
+// ======================================================
+void initSprites()
+{
+    // ==================================================
+    // DNA
+    // ==================================================
+    dnaSprite.setColorDepth(
+        16
+    );
+
+
+    if (
+        !dnaSprite.createSprite(
+            DNA_W,
+            DNA_H
+        )
+    )
+    {
+        Serial.println(
+            "[ERROR] DNA sprite create failed"
+        );
+    }
+
+
+    // ==================================================
+    // Loading
+    // ==================================================
+    loadSprite.setColorDepth(
+        16
+    );
+
+
+    if (
+        !loadSprite.createSprite(
+            LOAD_W,
+            LOAD_H
+        )
+    )
+    {
+        Serial.println(
+            "[ERROR] Loading sprite create failed"
+        );
+    }
+}
+
+
+// ======================================================
+// Setup
+// ======================================================
+void setup()
+{
+    Serial.begin(
+        115200
+    );
+
+
+    delay(
+        500
+    );
+
+
+    // ==================================================
+    // LCD
+    // ==================================================
+    lcd.init();
+
+
+    lcd.setRotation(
+        1
+    );
+
+
+    lcd.setBrightness(
+        0
+    );
+
+
+    lcd.fillScreen(
+        TFT_BLACK
+    );
+
+
+    // ==================================================
+    // SD
+    // ==================================================
+    sdSPI.begin(
+        SD_SCK,
+        SD_MISO,
+        SD_MOSI,
+        SD_CS
+    );
+
+
+    if (
+        !SD.begin(
+            SD_CS,
+            sdSPI,
+            4000000
+        )
+    )
+    {
+        Serial.println(
+            "[ERROR] SD init failed"
+        );
+
+        return;
+    }
+
+
+    Serial.println(
+        "[OK] SD init"
+    );
+
+
+    // ==================================================
+    // 背光
+    // ==================================================
+    lcd.setBrightness(
+        128
+    );
+
+
+    // ==================================================
+    // I2S
+    // ==================================================
+    audio.setPinout(
+        I2S_BCLK,
+        I2S_LRC,
+        I2S_DOUT
+    );
+
+
+    // ==================================================
+    // 固定音量
+    // ==================================================
+    audio.setVolume(
+        15
+    );
+
+
+    // ==================================================
+    // 開機動畫 + boot.mp3
+    // ==================================================
+    playAnimation();
+
+
+    // ==================================================
+    // 載入 test.bmp
+    // ==================================================
+    if (
+        !loadTestBMP()
+    )
+    {
+        Serial.println(
+            "[ERROR] loadTestBMP failed"
+        );
+
+        return;
+    }
+
+
+    // ==================================================
+    // 建立 Sprite
+    // ==================================================
+    initSprites();
+
+
+    // ==================================================
+    // 建立 DNA 背景
+    // ==================================================
+    if (
+        !createDNABackground()
+    )
+    {
+        Serial.println(
+            "[ERROR] DNA background failed"
+        );
+
+        return;
+    }
+
+
+    // ==================================================
+    // 建立 Loading 背景
+    // ==================================================
+    if (
+        !createLoadingBackground()
+    )
+    {
+        Serial.println(
+            "[ERROR] Loading background failed"
+        );
+
+        return;
+    }
+
+
+    // ==================================================
+    // DNA STATIC TEST
+    // ==================================================
+    Serial.println();
+    Serial.println(
+        "================================"
+    );
+    Serial.println(
+        "       DNA STATIC TEST"
+    );
+    Serial.println(
+        "================================"
+    );
+    Serial.println(
+        "2 thick curves."
+    );
+    Serial.println(
+        "3 irregular balls."
+    );
+    Serial.println(
+        "Slow curve movement."
+    );
+    Serial.println(
+        "Fixed volume = 15."
+    );
+    Serial.println(
+        "================================"
+    );
+
+
+    // --------------------------------------------------
+    // 靜態 DNA
+    // --------------------------------------------------
+    updateDNA(
+        0.0f
+    );
+
+
+    // --------------------------------------------------
+    // 停 3 秒
+    // --------------------------------------------------
+    delay(
+        3000
+    );
+
+
+    Serial.println();
+    Serial.println(
+        "================================"
+    );
+    Serial.println(
+        "       DNA STATIC TEST END"
+    );
+    Serial.println(
+        "================================"
+    );
+    Serial.println();
+
+
+    // ==================================================
+    // Loading 從 0%
+    // ==================================================
+    updateLoadingBar(
+        0
+    );
+
+
+    // ==================================================
+    // 停止 boot.mp3
+    // ==================================================
+    audio.stopSong();
+
+
+    // ==================================================
+    // 播放正式音樂
+    // ==================================================
+    audio.setVolume(
+        15
+    );
+
+
+    audio.connecttoFS(
+        SD,
+        "/GIF/test.mp3"
+    );
+}
+
+
+// ======================================================
+// Loop
+// ======================================================
+void loop()
+{
+    // ==================================================
+    // MP3
+    // ==================================================
+    audio.loop();
+
+
+    // ==================================================
+    // 動畫更新
+    // ==================================================
+    static uint32_t lastFrame =
+        0;
+
+
+    uint32_t now =
+        millis();
+
+
+    if (
+        now - lastFrame
+        >=
+        FINAL_FRAME_MS
+    )
+    {
+        lastFrame =
+            now;
+
+
+        // ------------------------------------------------
+        // DNA
+        // ------------------------------------------------
+        updateDNA(
+            now / 1000.0f
+        );
+
+
+        // ------------------------------------------------
+        // Loading
+        // ------------------------------------------------
+        static uint32_t loadingStart =
+            now;
+
+
+        uint32_t elapsed =
+            now -
+            loadingStart;
+
+
+        updateLoadingBar(
+            elapsed
+        );
+    }
+}
+
+
+// ======================================================
+// Audio Callback
+// ======================================================
+void audio_info(
+    const char *info
+)
+{
+}
+
+
+void audio_eof_mp3(
+    const char *info
+)
+{
+}
+
